@@ -24,10 +24,10 @@ backend-clean: ## Clean backend build artifacts
 frontend-install: ## Install frontend dependencies
 	cd frontend && npm install
 
-frontend-dev: ## Start frontend dev server (port 5173)
+frontend-dev: frontend-install ## Start frontend dev server (port 5173)
 	cd frontend && npm run dev
 
-frontend-build: ## Build frontend for production
+frontend-build: frontend-install ## Build frontend for production
 	cd frontend && npm run build
 
 frontend-clean: ## Clean frontend node_modules and build
