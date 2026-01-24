@@ -124,6 +124,18 @@ func (r *registry) getHostConn(name string) *wsClient {
 	return room.hostConn
 }
 
+func (r *registry) hasHost(name string) bool {
+	r.mu.RLock()
+	room := r.rooms[name]
+	r.mu.RUnlock()
+	if room == nil {
+		return false
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.hostConn != nil && room.HostID != ""
+}
+
 func (r *registry) getListeners(name string) []*wsClient {
 	r.mu.RLock()
 	room := r.rooms[name]
@@ -160,6 +172,37 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 
+	http.HandleFunc("/rooms", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		type RoomInfo struct {
+			Name      string `json:"name"`
+			HasHost   bool   `json:"hasHost"`
+			Listeners int    `json:"listeners"`
+		}
+		var rooms []RoomInfo
+		reg.mu.RLock()
+		for name, room := range reg.rooms {
+			room.mu.RLock()
+			if room.hostConn != nil && room.HostID != "" {
+				rooms = append(rooms, RoomInfo{
+					Name:      name,
+					HasHost:   true,
+					Listeners: len(room.Listeners),
+				})
+			}
+			room.mu.RUnlock()
+		}
+		reg.mu.RUnlock()
+		_ = json.NewEncoder(w).Encode(rooms)
+	})
+
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		room := r.URL.Query().Get("room")
 		roleStr := r.URL.Query().Get("role")
@@ -187,6 +230,13 @@ func main() {
 
 		switch client.role {
 		case RoleHost:
+			// Check if room already has an active host
+			if reg.hasHost(room) {
+				_ = send(client, outbound{Type: "error", Payload: json.RawMessage(`"room already has an active host"`)})
+				client.conn.Close()
+				log.Printf("Host rejected: room=%s id=%s (room already has host)", room, client.id)
+				return
+			}
 			reg.setHost(room, client.id, client)
 			log.Printf("Host connected: room=%s id=%s", room, client.id)
 			// Notify all existing listeners that host is ready
@@ -232,12 +282,29 @@ func readLoop(reg *registry, client *wsClient) {
 		}
 	}()
 
+	const (
+		readDeadline  = 90 * time.Second
+		pingInterval  = 30 * time.Second
+	)
+
 	client.conn.SetReadLimit(1 << 20)
-	client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	client.conn.SetReadDeadline(time.Now().Add(readDeadline))
 	client.conn.SetPongHandler(func(string) error {
-		client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		client.conn.SetReadDeadline(time.Now().Add(readDeadline))
 		return nil
 	})
+
+	// Start ping ticker to keep connection alive
+	ticker := time.NewTicker(pingInterval)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			if err := client.conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(10*time.Second)); err != nil {
+				break
+			}
+		}
+	}()
 
 	for {
 		_, data, err := client.conn.ReadMessage()

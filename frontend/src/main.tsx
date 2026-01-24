@@ -2,7 +2,7 @@ import React from 'react'
 import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Link, Route, Routes } from 'react-router-dom'
 import Host from './pages/Host'
-import Listener from './pages/Listener'
+import Browse from './pages/Browse'
 
 function App() {
   return (
@@ -11,13 +11,13 @@ function App() {
         <h1>ListenToGod</h1>
         <nav>
           <Link to="/host">Host</Link>
-          <Link to="/listen">Listener</Link>
+                    <Link to="/browse">Browse</Link>
         </nav>
       </header>
       <Routes>
         <Route path="/" element={<Home/>} />
         <Route path="/host" element={<Host/>} />
-        <Route path="/listen" element={<Listener/>} />
+          <Route path="/browse" element={<Browse/>} />
       </Routes>
     </div>
   )
@@ -26,7 +26,7 @@ function App() {
 function Home(){
   return (
     <div>
-      <p>Select your role above: Host (speaker) or Listener.</p>
+      <p>Select your role above: Host (speaker) or Browse active rooms.</p>
     </div>
   )
 }

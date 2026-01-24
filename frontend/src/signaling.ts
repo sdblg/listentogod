@@ -25,9 +25,11 @@ export async function getMicStream(deviceId?: string): Promise<MediaStream> {
   return navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: deviceId ? { exact: deviceId } : undefined,
+      channelCount: 1,
+      sampleRate: 48000,
       echoCancellation: true,
       noiseSuppression: true,
-      autoGainControl: true
+      autoGainControl: false
     }
   })
 }
