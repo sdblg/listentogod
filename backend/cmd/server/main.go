@@ -185,14 +185,15 @@ func main() {
 			conn: c,
 		}
 
-		if client.role == RoleHost {
+		switch client.role {
+		case RoleHost:
 			reg.setHost(room, client.id, client)
 			log.Printf("Host connected: room=%s id=%s", room, client.id)
 			// Notify all existing listeners that host is ready
 			for _, listener := range reg.getListeners(room) {
 				_ = send(listener, outbound{Type: "host-ready"})
 			}
-		} else {
+		case RoleListener:
 			reg.addListener(room, client)
 			hostConn := reg.getHostConn(room)
 			if hostConn != nil {
@@ -215,13 +216,14 @@ func readLoop(reg *registry, client *wsClient) {
 		hostConn := reg.getHostConn(client.room)
 		reg.remove(client.room, client.id)
 
-		if client.role == RoleHost {
+		switch client.role {
+		case RoleHost:
 			// Host left - notify all listeners
 			for _, listener := range reg.getListeners(client.room) {
 				_ = send(listener, outbound{Type: "host-left"})
 			}
 			log.Printf("Host disconnected: room=%s id=%s", client.room, client.id)
-		} else {
+		case RoleListener:
 			// Listener left - notify host
 			if hostConn != nil {
 				_ = send(hostConn, outbound{Type: "listener-left", From: client.id})
@@ -266,14 +268,14 @@ func readLoop(reg *registry, client *wsClient) {
 				}
 			}
 		case "ice":
-			// Route ICE candidates
 			if in.To != "" {
-				if client.role == RoleHost {
-					// Host sends ICE to a specific listener
+				switch client.role {
+				case RoleHost:
+					// Host sends ICE to specific listener
 					if listener := reg.getListener(client.room, in.To); listener != nil {
 						_ = send(listener, outbound{Type: "ice", From: client.id, Payload: in.Payload})
 					}
-				} else if client.role == RoleListener {
+				case RoleListener:
 					// Listener sends ICE to host
 					hostConn := reg.getHostConn(client.room)
 					if hostConn != nil {
