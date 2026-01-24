@@ -1,4 +1,5 @@
 package main
+
 import (
 	"encoding/json"
 	"log"
@@ -41,50 +42,118 @@ type outbound struct {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-type room struct {
+type broadcastRoom struct {
 	HostID    string
-	Listeners map[string]struct{}
+	Listeners map[string]*wsClient
+	mu        sync.RWMutex
+	hostConn  *wsClient
 }
 
 type registry struct {
 	mu    sync.RWMutex
-	rooms map[string]*room
+	rooms map[string]*broadcastRoom
 }
 
-func newRegistry() *registry { return &registry{rooms: make(map[string]*room)} }
-func (r *registry) setHost(name, hostID string) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	rm := r.rooms[name]
-	if rm == nil { rm = &room{Listeners: make(map[string]struct{})}; r.rooms[name] = rm }
-	rm.HostID = hostID
+func newRegistry() *registry { return &registry{rooms: make(map[string]*broadcastRoom)} }
+
+func (r *registry) getOrCreateRoom(name string) *broadcastRoom {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	room, ok := r.rooms[name]
+	if !ok {
+		room = &broadcastRoom{Listeners: make(map[string]*wsClient)}
+		r.rooms[name] = room
+	}
+	return room
 }
-func (r *registry) addListener(name, id string) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	rm := r.rooms[name]
-	if rm == nil { rm = &room{Listeners: make(map[string]struct{})}; r.rooms[name] = rm }
-	rm.Listeners[id] = struct{}{}
+
+func (r *registry) setHost(name, hostID string, conn *wsClient) *broadcastRoom {
+	room := r.getOrCreateRoom(name)
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	room.HostID = hostID
+	room.hostConn = conn
+	return room
 }
-func (r *registry) remove(name, id string) (wasHost bool, listenersLeft int) {
-	r.mu.Lock(); defer r.mu.Unlock()
-	rm := r.rooms[name]
-	if rm == nil { return false, 0 }
-	if rm.HostID == id { wasHost = true; rm.HostID = "" } else { delete(rm.Listeners, id) }
-	listenersLeft = len(rm.Listeners)
-	if rm.HostID == "" && listenersLeft == 0 { delete(r.rooms, name) }
-	return
+
+func (r *registry) addListener(name string, listener *wsClient) *broadcastRoom {
+	room := r.getOrCreateRoom(name)
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	room.Listeners[listener.id] = listener
+	return room
 }
-func (r *registry) getHost(name string) string { r.mu.RLock(); defer r.mu.RUnlock(); if rm:=r.rooms[name]; rm!=nil { return rm.HostID }; return "" }
-func (r *registry) getListeners(name string) []string { r.mu.RLock(); defer r.mu.RUnlock(); rm:=r.rooms[name]; if rm==nil { return nil }; out:=make([]string,0,len(rm.Listeners)); for id := range rm.Listeners { out = append(out,id) }; return out }
+
+func (r *registry) remove(name, id string) {
+	r.mu.RLock()
+	room := r.rooms[name]
+	r.mu.RUnlock()
+
+	if room == nil {
+		return
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	delete(room.Listeners, id)
+	if room.HostID == id {
+		room.HostID = ""
+		room.hostConn = nil
+	}
+
+	// Clean up empty rooms
+	if room.HostID == "" && len(room.Listeners) == 0 {
+		r.mu.Lock()
+		delete(r.rooms, name)
+		r.mu.Unlock()
+	}
+}
+
+func (r *registry) getHostConn(name string) *wsClient {
+	r.mu.RLock()
+	room := r.rooms[name]
+	r.mu.RUnlock()
+	if room == nil {
+		return nil
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.hostConn
+}
+
+func (r *registry) getListeners(name string) []*wsClient {
+	r.mu.RLock()
+	room := r.rooms[name]
+	r.mu.RUnlock()
+	if room == nil {
+		return nil
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	out := make([]*wsClient, 0, len(room.Listeners))
+	for _, listener := range room.Listeners {
+		out = append(out, listener)
+	}
+	return out
+}
+
+func (r *registry) getListener(name, id string) *wsClient {
+	r.mu.RLock()
+	room := r.rooms[name]
+	r.mu.RUnlock()
+	if room == nil {
+		return nil
+	}
+	room.mu.RLock()
+	defer room.mu.RUnlock()
+	return room.Listeners[id]
+}
 
 func main() {
 	reg := newRegistry()
-	clients := struct {
-		mu sync.RWMutex
-		byID map[string]*wsClient
-	}{byID: make(map[string]*wsClient)}
 
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -99,7 +168,11 @@ func main() {
 			return
 		}
 		var role Role
-		if roleStr == string(RoleHost) { role = RoleHost } else { role = RoleListener }
+		if roleStr == string(RoleHost) {
+			role = RoleHost
+		} else {
+			role = RoleListener
+		}
 		c, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("websocket upgrade error: %v", err)
@@ -112,20 +185,23 @@ func main() {
 			conn: c,
 		}
 
-		clients.mu.Lock()
-		clients.byID[client.id] = client
-		clients.mu.Unlock()
-
 		if client.role == RoleHost {
-			reg.setHost(room, client.id)
+			reg.setHost(room, client.id, client)
 			log.Printf("Host connected: room=%s id=%s", room, client.id)
+			// Notify all existing listeners that host is ready
+			for _, listener := range reg.getListeners(room) {
+				_ = send(listener, outbound{Type: "host-ready"})
+			}
 		} else {
-			reg.addListener(room, client.id)
-			notifyHostListenerJoined(reg, clients, room, client.id)
+			reg.addListener(room, client)
+			hostConn := reg.getHostConn(room)
+			if hostConn != nil {
+				_ = send(hostConn, outbound{Type: "listener-joined", From: client.id})
+			}
 			log.Printf("Listener connected: room=%s id=%s", room, client.id)
 		}
 
-		go readLoop(reg, clients, client)
+		go readLoop(reg, client)
 	})
 
 	addr := ":8080"
@@ -133,31 +209,25 @@ func main() {
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-func readLoop(reg *registry, pool struct{
-	mu   sync.RWMutex
-	byID map[string]*wsClient
-}, client *wsClient) {
+func readLoop(reg *registry, client *wsClient) {
 	defer func() {
 		client.conn.Close()
-		pool.mu.Lock()
-		delete(pool.byID, client.id)
-		pool.mu.Unlock()
-		wasHost, listenersLeft := reg.remove(client.room, client.id)
-		if wasHost {
-			// Inform all listeners host left
-			for _, lid := range reg.getListeners(client.room) {
-				if target := getClient(pool, lid); target != nil {
-					_ = send(target, outbound{Type: "host-left"})
-				}
+		hostConn := reg.getHostConn(client.room)
+		reg.remove(client.room, client.id)
+
+		if client.role == RoleHost {
+			// Host left - notify all listeners
+			for _, listener := range reg.getListeners(client.room) {
+				_ = send(listener, outbound{Type: "host-left"})
 			}
+			log.Printf("Host disconnected: room=%s id=%s", client.room, client.id)
 		} else {
-			// Inform host listener left
-			hostID := reg.getHost(client.room)
-			if host := getClient(pool, hostID); host != nil {
-				_ = send(host, outbound{Type: "listener-left", From: client.id})
+			// Listener left - notify host
+			if hostConn != nil {
+				_ = send(hostConn, outbound{Type: "listener-left", From: client.id})
 			}
+			log.Printf("Listener disconnected: room=%s id=%s", client.room, client.id)
 		}
-		log.Printf("Disconnected: room=%s id=%s wasHost=%v listenersLeft=%d", client.room, client.id, wasHost, listenersLeft)
 	}()
 
 	client.conn.SetReadLimit(1 << 20)
@@ -180,42 +250,41 @@ func readLoop(reg *registry, pool struct{
 
 		// Route signaling messages
 		switch in.Type {
-		case "offer", "answer", "ice":
-			if in.To == "" {
-				log.Printf("missing 'to' in message from %s type %s", client.id, in.Type)
-				continue
+		case "offer":
+			// If host sends offer, broadcast to all listeners
+			if client.role == RoleHost {
+				for _, listener := range reg.getListeners(client.room) {
+					_ = send(listener, outbound{Type: "offer", From: client.id, Payload: in.Payload})
+				}
 			}
-			if target := getClient(pool, in.To); target != nil {
-				_ = send(target, outbound{Type: in.Type, From: client.id, To: in.To, Payload: in.Payload})
-			} else {
-				log.Printf("target %s not found in room %s", in.To, client.room)
+		case "answer":
+			// If listener sends answer, route to host
+			if client.role == RoleListener {
+				hostConn := reg.getHostConn(client.room)
+				if hostConn != nil {
+					_ = send(hostConn, outbound{Type: "answer", From: client.id, To: hostConn.id, Payload: in.Payload})
+				}
+			}
+		case "ice":
+			// Route ICE candidates
+			if in.To != "" {
+				if client.role == RoleHost {
+					// Host sends ICE to a specific listener
+					if listener := reg.getListener(client.room, in.To); listener != nil {
+						_ = send(listener, outbound{Type: "ice", From: client.id, Payload: in.Payload})
+					}
+				} else if client.role == RoleListener {
+					// Listener sends ICE to host
+					hostConn := reg.getHostConn(client.room)
+					if hostConn != nil {
+						_ = send(hostConn, outbound{Type: "ice", From: client.id, Payload: in.Payload})
+					}
+				}
 			}
 		default:
 			log.Printf("unknown message type: %s", in.Type)
 		}
 	}
-}
-
-func notifyHostListenerJoined(reg *registry, pool struct{
-	mu   sync.RWMutex
-	byID map[string]*wsClient
-}, room string, listenerID string) {
-	hostID := reg.getHost(room)
-	if hostID == "" {
-		return
-	}
-	if host := getClient(pool, hostID); host != nil {
-		_ = send(host, outbound{Type: "listener-joined", From: listenerID})
-	}
-}
-
-func getClient(pool struct{
-	mu   sync.RWMutex
-	byID map[string]*wsClient
-}, id string) *wsClient {
-	pool.mu.RLock()
-	defer pool.mu.RUnlock()
-	return pool.byID[id]
 }
 
 func send(c *wsClient, msg outbound) error {
@@ -233,200 +302,3 @@ func newID() string {
 	}
 	return string(b)
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-}	return string(b)	}		b[i] = letters[rand.Intn(len(letters))]	for i := range b {	b := make([]byte, 12)	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"	rand.Seed(time.Now().UnixNano())func newID() string {}	return c.conn.WriteJSON(msg)	defer c.outLock.Unlock()	c.outLock.Lock()func send(c *wsClient, msg outbound) error {}	return pool.byID[id]	defer pool.mu.RUnlock()	pool.mu.RLock()}, id string) *wsClient {	byID map[string]*wsClient	mu   sync.RWMutexfunc getClient(pool struct{}	}		_ = send(host, outbound{Type: "listener-joined", From: listenerID})	if host := getClient(pool, hostID); host != nil {	}		return	if hostID == "" {	hostID := reg.GetHost(room)}, room string, listenerID string) {	byID map[string]*wsClient	mu   sync.RWMutexfunc notifyHostListenerJoined(reg *signaling.Registry, pool struct{}	}		}			log.Printf("unknown message type: %s", in.Type)		default:			}				log.Printf("target %s not found in room %s", in.To, client.room)			} else {				_ = send(target, outbound{Type: in.Type, From: client.id, To: in.To, Payload: in.Payload})			if target := getClient(pool, in.To); target != nil {			}				continue				log.Printf("missing 'to' in message from %s type %s", client.id, in.Type)			if in.To == "" {		case "offer", "answer", "ice":		switch in.Type {		// Route signaling messages		}			continue			log.Printf("invalid json from %s: %v", client.id, err)		if err := json.Unmarshal(data, &in); err != nil {		var in inbound		}			break		if err != nil {		_, data, err := client.conn.ReadMessage()	for {	})		return nil		client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))	client.conn.SetPongHandler(func(string) error {	client.conn.SetReadDeadline(time.Now().Add(60 * time.Second))	client.conn.SetReadLimit(1 << 20)	}()		log.Printf("Disconnected: room=%s id=%s wasHost=%v listenersLeft=%d", client.room, client.id, wasHost, listenersLeft)		}			}				_ = send(host, outbound{Type: "listener-left", From: client.id})			if host := getClient(pool, hostID); host != nil {			hostID := reg.GetHost(client.room)			// Inform host listener left		} else {			}				}					_ = send(target, outbound{Type: "host-left"})				if target := getClient(pool, lid); target != nil {			for _, lid := range reg.GetListeners(client.room) {			// Inform all listeners host left		if wasHost {		wasHost, listenersLeft := reg.Remove(client.room, client.id)		pool.mu.Unlock()		delete(pool.byID, client.id)		pool.mu.Lock()		client.conn.Close()	defer func() {}, client *wsClient) {	byID map[string]*wsClient	mu   sync.RWMutexfunc readLoop(reg *signaling.Registry, pool struct{}	log.Fatal(http.ListenAndServe(addr, nil))	log.Printf("Signaling server listening on %s", addr)	addr := ":8080"	})		go readLoop(reg, clients, client)		}			log.Printf("Listener connected: room=%s id=%s", room, client.id)			notifyHostListenerJoined(reg, clients, room, client.id)			reg.AddListener(room, client.id)		} else {			log.Printf("Host connected: room=%s id=%s", room, client.id)			reg.SetHost(room, client.id)		if client.role == signaling.RoleHost {		clients.mu.Unlock()		clients.byID[client.id] = client		clients.mu.Lock()		}			conn: c,			role: role,			room: room,			id:   newID(),		client := &wsClient{		}			return			log.Printf("websocket upgrade error: %v", err)		if err != nil {		c, err := upgrader.Upgrade(w, r, nil)		}			role = signaling.RoleListener		} else {			role = signaling.RoleHost		if roleStr == string(signaling.RoleHost) {		var role signaling.Role		}			return			http.Error(w, "missing room or role", http.StatusBadRequest)		if room == "" || roleStr == "" {		roleStr := r.URL.Query().Get("role")		room := r.URL.Query().Get("room")	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {	})		_, _ = w.Write([]byte("ok"))		w.WriteHeader(http.StatusOK)	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {	}{byID: make(map[string]*wsClient)}		byID map[string]*wsClient		mu sync.RWMutex	clients := struct {	reg := signaling.NewRegistry()func main() {}	CheckOrigin: func(r *http.Request) bool { return true },	WriteBufferSize: 4096,	ReadBufferSize:  4096,var upgrader = websocket.Upgrader{}	Payload json.RawMessage `json:"payload,omitempty"`	To      string          `json:"to,omitempty"`	From    string          `json:"from,omitempty"`	Type    string          `json:"type"`type outbound struct {}	Payload json.RawMessage `json:"payload,omitempty"`	To      string          `json:"to,omitempty"`	Type    string          `json:"type"`type inbound struct {}	outLock sync.Mutex	conn    *websocket.Conn	role    signaling.Role	room    string	id      stringtype wsClient struct {)	"listentogod/internal/signaling"	"github.com/gorilla/websocket"	"time"	"sync"	"net/http"	"math/rand"	"log"	"encoding/json"import (
