@@ -6,7 +6,12 @@ export type SignalingMessage = {
 }
 
 export function connectSignaling({room, role, server}: {room: string; role: 'host'|'listener'; server?: string}) {
-  const url = `${server || location.protocol.replace('http','ws') + '//' + location.hostname + ':8080'}/ws?room=${encodeURIComponent(room)}&role=${role}`
+  // Determine WebSocket URL based on current page location
+  let wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws'
+  let wsHost = location.hostname
+  let wsPort = location.protocol === 'https:' ? '8443' : '8080'
+  
+  const url = `${server || wsProtocol + '://' + wsHost + ':' + wsPort}/ws?room=${encodeURIComponent(room)}&role=${role}`
   console.log('Connecting to WebSocket:', url)
   const ws = new WebSocket(url)
   ws.onerror = (error) => {
@@ -22,6 +27,20 @@ export function connectSignaling({room, role, server}: {room: string; role: 'hos
 }
 
 export async function getMicStream(deviceId?: string): Promise<MediaStream> {
+  // Check if mediaDevices is available (requires secure context)
+  if (!navigator.mediaDevices) {
+    throw new Error(
+      'Media devices not available. This app requires HTTPS or localhost. ' +
+      'If using an IP address, make sure you\'re accessing via HTTPS.'
+    )
+  }
+  
+  if (!navigator.mediaDevices.getUserMedia) {
+    throw new Error(
+      'getUserMedia is not supported in this browser or secure context.'
+    )
+  }
+
   return navigator.mediaDevices.getUserMedia({
     audio: {
       deviceId: deviceId ? { exact: deviceId } : undefined,
@@ -29,8 +48,10 @@ export async function getMicStream(deviceId?: string): Promise<MediaStream> {
       sampleRate: 48000,
       echoCancellation: true,
       noiseSuppression: true,
-      autoGainControl: false
-    }
+      autoGainControl: true,
+      // Advanced constraints for better voice quality
+      latency: 0.01,
+    } as MediaTrackConstraints
   })
 }
 

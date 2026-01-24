@@ -5,6 +5,7 @@ import (
 	"log"
 	"math/rand"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -257,6 +258,19 @@ func main() {
 
 	addr := ":8080"
 	log.Printf("Signaling server listening on %s", addr)
+	
+	// Check if certificates exist for TLS (shared with frontend)
+	certPath := "../frontend/.cert/cert.pem"
+	keyPath := "../frontend/.cert/key.pem"
+	
+	// Try to use TLS if certificates exist, otherwise use plain HTTP
+	if _, err := os.Stat(certPath); err == nil {
+		if _, err := os.Stat(keyPath); err == nil {
+			log.Printf("Starting with TLS (WSS)")
+			log.Fatal(http.ListenAndServeTLS(":8443", certPath, keyPath, nil))
+		}
+	}
+	
 	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
