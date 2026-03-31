@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
-import { connectSignaling, getMicStream, makePeerConnection, SignalingMessage } from '../signaling'
 import { QRCodeSVG } from 'qrcode.react'
+import { useEffect, useRef, useState } from 'react'
+import { connectSignaling, getMicStream, makePeerConnection, SignalingMessage } from '../signaling'
 
 export default function Host(){
   const rooms = [
@@ -38,9 +38,9 @@ export default function Host(){
       localStreamRef.current = mic
       startMeter(mic)
       
-      // Generate listener URL with local network IP
+      // Generate listener URL with local network IP (avoid localhost QR links)
       const protocol = window.location.protocol
-      const hostname = window.location.hostname === 'localhost' ? getLocalIP() : window.location.hostname
+      const hostname = await getLocalIP()
       const port = window.location.port ? `:${window.location.port}` : ''
       const url = `${protocol}//${hostname}${port}/listen?room=${encodeURIComponent(room)}`
       console.log('Generated listener URL:', url)
@@ -175,10 +175,44 @@ export default function Host(){
     setMicLevel(0)
   }
 
-  function getLocalIP() {
-    // Fallback to showing window.location.hostname
-    // In production, you might want to display the actual IP from the network
-    return window.location.hostname
+  async function getLocalIP() {
+    if (window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+      return window.location.hostname
+    }
+
+    return new Promise<string>((resolve) => {
+      const pc = new RTCPeerConnection({ iceServers: [] })
+      let foundIP: string | null = null
+
+      function cleanup() {
+        pc.close()
+      }
+
+      pc.onicecandidate = (event) => {
+        if (!event.candidate || !event.candidate.candidate) return
+        const parts = event.candidate.candidate.split(' ')
+        const ip = parts[4]
+        const type = parts[7]
+        if (type === 'host' && ip && !ip.startsWith('127.') && !ip.startsWith('169.254.')) {
+          foundIP = ip
+          cleanup()
+          resolve(ip)
+        }
+      }
+
+      pc.createDataChannel('a')
+      pc.createOffer().then((offer) => pc.setLocalDescription(offer)).catch(() => {
+        cleanup()
+        resolve(window.location.hostname)
+      })
+
+      setTimeout(() => {
+        if (!foundIP) {
+          cleanup()
+          resolve(window.location.hostname)
+        }
+      }, 1500)
+    })
   }
 
   return (
