@@ -37,3 +37,25 @@ root.render(
     <App/>
   </BrowserRouter>
 )
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('/service-worker.js').then(() => {
+      const pingServiceWorker = () => {
+        navigator.serviceWorker.controller?.postMessage({ type: 'KEEP_ALIVE' })
+      }
+
+      if (!navigator.serviceWorker.controller) {
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          window.location.reload()
+        }, { once: true })
+      }
+
+      window.setInterval(pingServiceWorker, 25_000)
+      document.addEventListener('visibilitychange', pingServiceWorker)
+      pingServiceWorker()
+    }).catch((error) => {
+      console.warn('Service worker registration failed', error)
+    })
+  })
+}

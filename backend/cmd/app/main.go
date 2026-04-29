@@ -296,10 +296,12 @@ func readLoop(reg *registry, client *wsClient) {
 		}
 	}()
 
-	const (
-		readDeadline  = 90 * time.Second
-		pingInterval  = 30 * time.Second
-	)
+	readDeadline := 90 * time.Second
+	if client.role == RoleListener {
+		// Mobile listeners may be background-throttled; allow a longer grace period.
+		readDeadline = 8 * time.Minute
+	}
+	pingInterval := 30 * time.Second
 
 	client.conn.SetReadLimit(1 << 20)
 	client.conn.SetReadDeadline(time.Now().Add(readDeadline))
@@ -333,6 +335,10 @@ func readLoop(reg *registry, client *wsClient) {
 
 		// Route signaling messages
 		switch in.Type {
+		case "ping":
+			_ = send(client, outbound{Type: "pong", Payload: in.Payload})
+		case "pong":
+			// no-op, just a keepalive response
 		case "offer":
 			// If host sends offer, broadcast to all listeners
 			if client.role == RoleHost {

@@ -1,6 +1,14 @@
 import { QRCodeSVG } from 'qrcode.react'
 import { useEffect, useRef, useState } from 'react'
-import { connectSignaling, getMicStream, makePeerConnection, SignalingMessage } from '../signaling'
+import {
+  clearMediaSession,
+  releaseWakeLock,
+  requestWakeLock,
+  startBackgroundSession,
+  stopBackgroundSession,
+  updateMediaSession
+} from '../backgroundSession'
+import { getMicStream, makePeerConnection, RobustSignalingClient, SignalingMessage } from '../signaling'
 
 export default function Host(){
   const rooms = [
@@ -13,7 +21,7 @@ export default function Host(){
   const [listenerCount, setListenerCount] = useState(0)
   const [listenerUrl, setListenerUrl] = useState('')
   const [micLevel, setMicLevel] = useState(0)
-  const wsRef = useRef<WebSocket | null>(null)
+  const signalingRef = useRef<RobustSignalingClient | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const peersRef = useRef<Map<string, RTCPeerConnection>>(new Map())
   const lastErrorRef = useRef(false)
@@ -21,18 +29,63 @@ export default function Host(){
   const analyserRef = useRef<AnalyserNode | null>(null)
   const dataArrayRef = useRef<Uint8Array | null>(null)
   const rafRef = useRef<number | null>(null)
+  const shouldAutoResumeRef = useRef(false)
+  const connectedRef = useRef(false)
+  const restartingRef = useRef(false)
+
+  useEffect(() => {
+    connectedRef.current = connected
+  }, [connected])
 
   useEffect(()=>{
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return
+      if (!shouldAutoResumeRef.current) return
+      if (connectedRef.current) return
+      if (restartingRef.current) return
+      restartHostingAfterResume()
+    }
+
+    document.addEventListener('visibilitychange', onVisibilityChange)
     return ()=>{
-      wsRef.current?.close()
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      signalingRef.current?.disconnect()
       peersRef.current.forEach(pc=>pc.close())
       localStreamRef.current?.getTracks().forEach(t=>t.stop())
       stopMeter()
+      stopBackgroundSession()
+      clearMediaSession()
+      releaseWakeLock().catch(() => {})
     }
   },[])
 
-  async function startHosting(){
+  async function restartHostingAfterResume(){
+    restartingRef.current = true
+    setStatus('Resuming broadcast...')
     try {
+      signalingRef.current?.disconnect()
+      signalingRef.current = null
+      peersRef.current.forEach(pc => pc.close())
+      peersRef.current.clear()
+      localStreamRef.current?.getTracks().forEach(t => t.stop())
+      localStreamRef.current = null
+      await startHosting()
+    } finally {
+      restartingRef.current = false
+    }
+  }
+
+  async function startHosting(){
+    if (connectedRef.current) {
+      return
+    }
+    try {
+      shouldAutoResumeRef.current = true
+      setStatus('Preparing background media...')
+      await startBackgroundSession()
+      await requestWakeLock()
+      updateMediaSession({ title: 'Live Translation', artist: 'Listening...' })
+
       setStatus('Getting microphone...')
       const mic = await getMicStream()
       localStreamRef.current = mic
@@ -42,28 +95,32 @@ export default function Host(){
       const protocol = window.location.protocol
       const hostname = await getLocalIP()
       const port = window.location.port ? `:${window.location.port}` : ''
-      const url = `${protocol}//${hostname}${port}/listen?room=${encodeURIComponent(room)}`
+      const url = `${protocol}//${hostname}${port}/browse?room=${encodeURIComponent(room)}`
       console.log('Generated listener URL:', url)
       setListenerUrl(url)
       
       setStatus('Connecting signaling...')
-      const ws = connectSignaling({room, role: 'host'})
-      wsRef.current = ws
-      ws.onopen = ()=>{ setConnected(true); setStatus('Broadcasting...') }
-      ws.onclose = ()=>{
+      const signaling = new RobustSignalingClient({ room, role: 'host', heartbeatIntervalMs: 7_000 })
+      signalingRef.current = signaling
+      signaling.onOpen(() => { setConnected(true); setStatus('Broadcasting...') })
+      signaling.onStateChange((state) => {
+        if (state === 'reconnecting') {
+          setStatus('Reconnecting signaling...')
+        }
+      })
+      signaling.onClose(() => {
         setConnected(false)
         if (lastErrorRef.current) {
           lastErrorRef.current = false
           return
         }
         setStatus('Disconnected')
-      }
-      ws.onmessage = async (ev)=>{
-        const msg: SignalingMessage = JSON.parse(ev.data)
+      })
+      signaling.onMessage(async (msg: SignalingMessage) => {
         if (msg.type === 'error') {
           lastErrorRef.current = true
           setStatus(`Error: ${msg.payload || 'Unknown error'}`)
-          ws.close()
+          signaling.disconnect()
           return
         }
         if (msg.type === 'listener-joined' && msg.from){
@@ -85,7 +142,8 @@ export default function Host(){
           if (pc){ pc.close(); peersRef.current.delete(msg.from) }
           setListenerCount(c => Math.max(0, c - 1))
         }
-      }
+      })
+      signaling.connect()
     } catch (err) {
       setStatus(`Error: ${err instanceof Error ? err.message : 'Unknown error'}`)
     }
@@ -108,22 +166,27 @@ export default function Host(){
 
     pc.onicecandidate = (ev)=>{
       if (ev.candidate){
-        wsRef.current?.send(JSON.stringify({ type: 'ice', to: listenerId, payload: ev.candidate }))
+        signalingRef.current?.send({ type: 'ice', to: listenerId, payload: ev.candidate })
       }
     }
 
     const offer = await pc.createOffer({ offerToReceiveAudio: false })
     await pc.setLocalDescription(offer)
-    wsRef.current?.send(JSON.stringify({ type: 'offer', payload: offer }))
+    signalingRef.current?.send({ type: 'offer', payload: offer })
   }
 
   function stopHosting(){
-    wsRef.current?.close()
+    shouldAutoResumeRef.current = false
+    signalingRef.current?.disconnect()
+    signalingRef.current = null
     peersRef.current.forEach(pc => pc.close())
     peersRef.current.clear()
     localStreamRef.current?.getTracks().forEach(t => t.stop())
     localStreamRef.current = null
     stopMeter()
+    stopBackgroundSession()
+    clearMediaSession()
+    releaseWakeLock().catch(() => {})
     setConnected(false)
     setListenerCount(0)
     setListenerUrl('')
