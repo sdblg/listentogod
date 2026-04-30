@@ -38,7 +38,7 @@ function createSignalingUrl({ room, role, server }: SignalingConnectArgs): strin
 
 export class RobustSignalingClient {
   private readonly args: SignalingConnectArgs
-  private readonly heartbeatIntervalMs: number
+  private heartbeatIntervalMs: number
   private readonly heartbeatTimeoutMs: number | null
   private readonly reconnectBaseDelayMs: number
   private readonly reconnectMaxDelayMs: number
@@ -72,6 +72,13 @@ export class RobustSignalingClient {
   onError(handler: (ev: Event) => void): void { this.errorHandlers.push(handler) }
   onMessage(handler: (msg: SignalingMessage) => void): void { this.messageHandlers.push(handler) }
   onStateChange(handler: (state: ConnectionState) => void): void { this.stateHandlers.push(handler) }
+  setHeartbeatIntervalMs(nextIntervalMs: number): void {
+    const safe = Math.max(1_000, Math.floor(nextIntervalMs))
+    this.heartbeatIntervalMs = safe
+    if (this.state === 'connected') {
+      this.startHeartbeat()
+    }
+  }
 
   connect(): void {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {

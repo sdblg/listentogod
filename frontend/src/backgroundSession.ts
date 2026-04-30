@@ -1,19 +1,21 @@
-const SILENT_MP3_DATA_URI =
-  'data:audio/mp3;base64,SUQzBAAAAAAAI1RTU0UAAAAPAAADTGF2ZjU2LjM2LjEwMAAAAAAAAAAAAAAA//OEAAAAAAAAAAAAAAAAAAAAAAAASW5mbwAAAA8AAAAEAAABIADAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV6urq6urq6urq6urq6urq6urq6urq6urq6v////////////////////////////////8AAAAATGF2YzU2LjQxAAAAAAAAAAAAAAAAJAAAAAAAAAAAASDs90hvAAAAAAAAAAAAAAAAAAAA//MUZAAAAAGkAAAAAAAAA0gAAAAATEFN//MUZAMAAAGkAAAAAAAAA0gAAAAARTMu//MUZAYAAAGkAAAAAAAAA0gAAAAAOTku//MUZAkAAAGkAAAAAAAAA0gAAAAANVVV'
+const SILENT_AUDIO_FILE_PATH = '/silent-noise.mp3'
 
 type MediaSessionCopy = {
   title: string
   artist: string
   album?: string
   artwork512?: string
-  onPlay?: () => void
-  onPause?: () => void
-  onStop?: () => void
+  onResumeAudioContext?: () => Promise<void> | void
+  onReconnectSignaling?: () => Promise<void> | void
+  onPlay?: () => Promise<void> | void
+  onPause?: () => Promise<void> | void
+  onStop?: () => Promise<void> | void
 }
 
 class WakeLockManager {
   private sentinel: WakeLockSentinel | null = null
   private active = false
+  private reacquireTimer: number | null = null
 
   constructor() {
     document.addEventListener('visibilitychange', () => {
@@ -27,21 +29,50 @@ class WakeLockManager {
     if (!('wakeLock' in navigator)) return false
     try {
       this.active = true
+      this.stopReacquireLoop()
       this.sentinel = await navigator.wakeLock.request('screen')
       this.sentinel.addEventListener('release', () => {
         this.sentinel = null
+        if (this.active) {
+          this.scheduleReacquire(500)
+        }
       })
       return true
     } catch {
+      if (this.active) {
+        this.scheduleReacquire(2_000)
+      }
       return false
     }
   }
 
   async release(): Promise<void> {
     this.active = false
+    this.stopReacquireLoop()
     if (this.sentinel) {
       await this.sentinel.release().catch(() => {})
       this.sentinel = null
+    }
+  }
+
+  private scheduleReacquire(delayMs: number): void {
+    this.stopReacquireLoop()
+    this.reacquireTimer = window.setTimeout(() => {
+      if (!this.active) return
+      if (document.visibilityState !== 'visible') {
+        this.scheduleReacquire(2_000)
+        return
+      }
+      this.request().catch(() => {
+        this.scheduleReacquire(2_000)
+      })
+    }, delayMs)
+  }
+
+  private stopReacquireLoop(): void {
+    if (this.reacquireTimer !== null) {
+      window.clearTimeout(this.reacquireTimer)
+      this.reacquireTimer = null
     }
   }
 }
@@ -55,10 +86,10 @@ class SilentAudioKeepAlive {
     if (this.started) return
 
     const audio = document.createElement('audio')
-    audio.src = SILENT_MP3_DATA_URI
+    audio.src = SILENT_AUDIO_FILE_PATH
     audio.loop = true
     audio.preload = 'auto'
-    audio.playsInline = true
+    audio.setAttribute('playsinline', 'true')
     audio.controls = false
     audio.muted = false
     // Keep non-zero volume to preserve media-player state on some mobile OSes.
@@ -138,14 +169,17 @@ export function updateMediaSession(copy: MediaSessionCopy): void {
   navigator.mediaSession.playbackState = 'playing'
   navigator.mediaSession.setActionHandler('play', () => {
     startBackgroundSession().catch(() => {})
-    copy.onPlay?.()
+    Promise.resolve(copy.onResumeAudioContext?.())
+      .then(() => copy.onReconnectSignaling?.())
+      .then(() => copy.onPlay?.())
+      .catch(() => {})
     navigator.mediaSession.playbackState = 'playing'
   })
   navigator.mediaSession.setActionHandler('pause', () => {
-    copy.onPause?.()
+    Promise.resolve(copy.onPause?.()).catch(() => {})
     navigator.mediaSession.playbackState = 'paused'
   })
-  navigator.mediaSession.setActionHandler('stop', () => { copy.onStop?.() })
+  navigator.mediaSession.setActionHandler('stop', () => { Promise.resolve(copy.onStop?.()).catch(() => {}) })
   if ('setPositionState' in navigator.mediaSession) {
     navigator.mediaSession.setPositionState({
       duration: Number.POSITIVE_INFINITY,

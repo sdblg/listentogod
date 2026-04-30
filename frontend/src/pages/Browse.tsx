@@ -16,14 +16,6 @@ type RoomInfo = {
   joinLabel?: string
 }
 
-type CapabilityState = {
-  secureContext: boolean
-  standalone: boolean
-  mediaSession: boolean
-  wakeLock: boolean
-  serviceWorkerControlled: boolean
-}
-
 export default function Browse(){
   const [rooms] = useState<RoomInfo[]>([
     { name: 'Chinese Language Room (中文房间)', description: 'Speak & listen in Chinese', flag: '🇨🇳', joinLabel: '加入' },
@@ -34,13 +26,6 @@ export default function Browse(){
   const [listenStatus, setListenStatus] = useState('')
   const [listening, setListening] = useState(false)
   const [audioLevel, setAudioLevel] = useState(0)
-  const [capabilityState, setCapabilityState] = useState<CapabilityState>({
-    secureContext: window.isSecureContext,
-    standalone: window.matchMedia('(display-mode: standalone)').matches,
-    mediaSession: 'mediaSession' in navigator,
-    wakeLock: 'wakeLock' in navigator,
-    serviceWorkerControlled: !!navigator.serviceWorker?.controller
-  })
 
   const signalingRef = useRef<RobustSignalingClient | null>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
@@ -53,28 +38,8 @@ export default function Browse(){
   const playbackWatchdogRef = useRef<number | null>(null)
 
   useEffect(() => {
-    // No polling needed; static curated room list
     return () => {
       stopListening()
-    }
-  }, [])
-
-  useEffect(() => {
-    const syncCapabilities = () => {
-      setCapabilityState({
-        secureContext: window.isSecureContext,
-        standalone: window.matchMedia('(display-mode: standalone)').matches,
-        mediaSession: 'mediaSession' in navigator,
-        wakeLock: 'wakeLock' in navigator,
-        serviceWorkerControlled: !!navigator.serviceWorker?.controller
-      })
-    }
-    syncCapabilities()
-    const timer = window.setInterval(syncCapabilities, 5_000)
-    window.addEventListener('focus', syncCapabilities)
-    return () => {
-      window.clearInterval(timer)
-      window.removeEventListener('focus', syncCapabilities)
     }
   }, [])
 
@@ -105,8 +70,10 @@ export default function Browse(){
 
   useEffect(() => {
     const onVisibilityChange = () => {
+      if (signalingRef.current) {
+        signalingRef.current.setHeartbeatIntervalMs(document.visibilityState === 'hidden' ? 3_000 : 7_000)
+      }
       if (document.visibilityState === 'hidden') {
-        // Do not suspend socket/audio on lock; keep session anchored.
         startBackgroundSession().catch(() => {})
         return
       }
@@ -144,6 +111,17 @@ export default function Browse(){
         artist: 'Listen to God',
         album: 'Church Service',
         artwork512: '/icons/icon-512.svg',
+        onResumeAudioContext: async () => {
+          const ctx = audioCtxRef.current
+          if (ctx && ctx.state === 'suspended') {
+            await ctx.resume().catch(() => {})
+          }
+        },
+        onReconnectSignaling: () => {
+          if (signalingRef.current && !signalingRef.current.isConnected()) {
+            signalingRef.current.connect()
+          }
+        },
         onPlay: () => { resumePlaybackFromMediaSession().catch(() => {}) },
         onPause: () => { audioOutRef.current?.pause() },
         onStop: () => stopListening()
@@ -188,13 +166,23 @@ export default function Browse(){
           if (audioOutRef.current){
             audioOutRef.current.srcObject = stream
             audioOutRef.current.play().catch(()=>{})
-            // Switch media focus to live stream element once available.
             stopBackgroundSession()
             updateMediaSession({
               title: 'Live Translation',
               artist: 'Listen to God',
               album: 'Church Service',
               artwork512: '/icons/icon-512.svg',
+              onResumeAudioContext: async () => {
+                const ctx = audioCtxRef.current
+                if (ctx && ctx.state === 'suspended') {
+                  await ctx.resume().catch(() => {})
+                }
+              },
+              onReconnectSignaling: () => {
+                if (signalingRef.current && !signalingRef.current.isConnected()) {
+                  signalingRef.current.connect()
+                }
+              },
               onPlay: () => { resumePlaybackFromMediaSession().catch(() => {}) },
               onPause: () => { audioOutRef.current?.pause() },
               onStop: () => stopListening()
@@ -288,25 +276,6 @@ export default function Browse(){
       <p>Select the curated room below and click Join.</p>
 
       {error && <p style={{color:'red'}}>{error}</p>}
-      {!capabilityState.secureContext && (
-        <p style={{color:'red'}}>
-          This session is not secure. Open using trusted HTTPS on local IP to improve lock-screen playback.
-        </p>
-      )}
-      {!capabilityState.standalone && (
-        <p style={{color:'#b36b00'}}>
-          Install as PWA (Add to Home Screen) for better background resilience.
-        </p>
-      )}
-
-      <div style={{marginTop:12, border:'1px solid #e6e6e6', borderRadius:8, padding:10, fontSize:'0.9em', background:'#fafafa'}}>
-        <div><strong>Runtime status</strong></div>
-        <div>Secure Context: {capabilityState.secureContext ? 'Yes' : 'No'}</div>
-        <div>PWA Standalone: {capabilityState.standalone ? 'Yes' : 'No'}</div>
-        <div>Media Session API: {capabilityState.mediaSession ? 'Yes' : 'No'}</div>
-        <div>Wake Lock API: {capabilityState.wakeLock ? 'Yes' : 'No'}</div>
-        <div>Service Worker Active: {capabilityState.serviceWorkerControlled ? 'Yes' : 'No'}</div>
-      </div>
 
       <div style={{marginTop:20, border:'1px solid #eee', borderRadius:8, padding:12}}>
         {rooms.map((room) => (
@@ -339,19 +308,6 @@ export default function Browse(){
             <p><strong>Room:</strong> {joinedRoom}</p>
             <p><strong>Status:</strong> {listenStatus || 'Connecting...'}</p>
             <audio ref={audioOutRef} autoPlay controls style={{width:'100%'}} />
-            {!listening && (
-              <button onClick={() => resumePlaybackFromMediaSession().catch(() => {})} style={{
-                marginTop: 8,
-                backgroundColor: '#007bff',
-                color: 'white',
-                border: 'none',
-                padding: '6px 12px',
-                borderRadius: 4,
-                cursor: 'pointer'
-              }}>
-                Resume Playback
-              </button>
-            )}
             {listening && (
               <div style={{marginTop:8}}>
                 <div style={{fontWeight:'bold'}}>Audio level:</div>

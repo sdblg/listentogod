@@ -39,6 +39,9 @@ export default function Host(){
 
   useEffect(()=>{
     const onVisibilityChange = () => {
+      if (signalingRef.current) {
+        signalingRef.current.setHeartbeatIntervalMs(document.visibilityState === 'hidden' ? 3_000 : 7_000)
+      }
       if (document.visibilityState !== 'visible') return
       if (!shouldAutoResumeRef.current) return
       if (connectedRef.current) return
@@ -84,7 +87,31 @@ export default function Host(){
       setStatus('Preparing background media...')
       await startBackgroundSession()
       await requestWakeLock()
-      updateMediaSession({ title: 'Live Translation', artist: 'Listening...' })
+      updateMediaSession({
+        title: 'Live Translation',
+        artist: 'Listen to God',
+        album: 'Church Service',
+        artwork512: '/icons/icon-512.svg',
+        onResumeAudioContext: async () => {
+          const ctx = audioCtxRef.current
+          if (ctx && ctx.state === 'suspended') {
+            await ctx.resume().catch(() => {})
+          }
+        },
+        onReconnectSignaling: () => {
+          if (signalingRef.current && !signalingRef.current.isConnected()) {
+            signalingRef.current.connect()
+          }
+        },
+        onPlay: async () => {
+          if (localStreamRef.current) {
+            return
+          }
+          await restartHostingAfterResume()
+        },
+        onPause: () => {},
+        onStop: () => stopHosting()
+      })
 
       setStatus('Getting microphone...')
       const mic = await getMicStream()
